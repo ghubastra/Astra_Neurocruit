@@ -1,0 +1,246 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { OpenAI } = require('openai');
+const XLSX = require('xlsx');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
+
+// Helper Functions
+const mergeRowFields = (row) => {
+  return `Skills: ${row['Skills'] || ''}\n` +
+    `Programming Languages: ${row['Programming Languages'] || ''}\n` +
+    `Years of experience: ${row['Years of experience'] || ''}\n` +
+    (row['Achievements'] ? `Other: ${row['Achievements']}` : '');
+};
+
+const extractJdTags = async (jdText) => {
+  const prompt = `Given the following job description, extract:
+- Skills (comma-separated)
+- Programming Languages (comma-separated)
+- Years of experience required (integer, use the highest if a range is provided, or estimate if not explicit)
+Respond ONLY with valid JSON using the keys: 'Skills', 'Programming Languages', 'Years of experience'.
+
+Job Description:
+${jdText}`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ 
+        role: "user", 
+        content: prompt 
+      }]
+    });
+
+    const content = response.choices[0].message.content.trim();
+    return JSON.parse(content);
+  } catch (error) {
+    console.error('Error extracting JD tags:', error);
+    return null;
+  }
+};
+
+const findBestResumes = async (jdTags, resumeData, topn = 3, threshold = 60) => {
+  const resumes = resumeData.map(row => ({
+    filename: row['resume_file_name'],
+    summary: mergeRowFields(row)
+  }));
+
+  const jdDesc = jdTags ? `Skills: ${jdTags['Skills'] || ''}
+Programming Languages: ${jdTags['Programming Languages'] || ''}
+Years of experience: ${jdTags['Years of experience'] || ''}` : '';
+
+  const prompt = `You are an expert recruitment specialist.
+
+The following is a job description for an open position:
+${jdDesc}
+
+Review ALL candidates below, referenced by their resume filenames.
+
+For each candidate:
+- **Intelligently compare the real focus of their work history, projects, and responsibilities to the genuine needs of this specific job.**
+- Go beyond matching keywords or skill/tool overlap. Carefully reason about whether this candidate's MAIN work experience, projects, and job roles show true alignment with the most important requirements, responsibilities, and real-world context described in the job description above.
+- Always prioritize candidates whose previous titles, key projects, contributions, and sustained responsibilities *demonstrate strong experience in the core domain, main tools, tech stack, and business context* of this exact job (e.g., frontend dev: React/TypeScript/UX; backend: APIs/databases/infrastructure; data: ML/pipelines/model deployment, etc).
+- Ignore candidates who only list the relevant tools or mention some buzzwords, but have clearly focused on unrelated domains or responsibilities.
+
+Output Format: A JSON object with filename:score pairs. Scores must be integers 0-100.
+Example: {"candidate.pdf": 85}
+
+Candidates to Evaluate:
+${resumes.map(res => `${res.filename}:\n${res.summary}`).join('\n---------------------------\n')}`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        {
+          role: "user",
+          content: prompt
+        }
+      ]
+    });
+
+    const content = response.choices[0].message.content.trim();
+    console.log('Raw LLM response for resume matching:', content);
+    
+    let scores = {};
+    try {
+      // Clean up the response to ensure valid JSON
+      let cleanedContent = content.replace(/[\r\n]+/g, ' ') // Remove newlines
+                          .replace(/'/g, '"')         // Replace single quotes with double quotes
+                          .replace(/,\s*}/g, '}')     // Remove trailing commas
+                          .replace(/([{,])\s*([a-zA-Z0-9_]+)\s*:/g, '$1"$2":') // Ensure property names are quoted
+                          .trim();
+      
+      // Extract only the JSON object if there's additional text
+      const jsonMatch = cleanedContent.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanedContent = jsonMatch[0];
+      }
+      
+      console.log('Cleaned JSON:', cleanedContent);
+      const obj = JSON.parse(cleanedContent);
+      
+      if (typeof obj === 'object' && obj !== null) {
+        // Convert and validate scores
+        scores = Object.fromEntries(
+          Object.entries(obj)
+            .filter(([filename, score]) => {
+              const isValidFilename = resumeData.some(row => row.resume_file_name === filename);
+              const isValidScore = typeof score === 'number' || (typeof score === 'string' && !isNaN(score));
+              return isValidFilename && isValidScore;
+            })
+            .map(([filename, score]) => [filename, parseInt(score)])
+        );
+      }
+    } catch (error) {
+      console.error('Error parsing LLM response:', error);
+      console.error('Problematic content:', content);
+      return { selected: [], scores: {} };
+    }
+
+    console.log('Processed scores before filtering:', scores);
+
+    // Filter and sort results
+    const validScores = Object.entries(scores)
+      .filter(([_, score]) => score >= threshold)
+      .sort(([, a], [, b]) => b - a);
+
+    console.log('Valid scores after filtering:', validScores);
+    
+    const selected = validScores.slice(0, topn).map(([filename]) => filename);
+    console.log('Selected resumes:', selected);
+
+    return {
+      selected,
+      scores
+    };
+  } catch (error) {
+    console.error('Error finding best resumes:', error);
+    return { selected: [], scores: {} };
+  }
+};
+
+const copyFilteredPdfs = (filteredFiles) => {
+  const sourceDir = path.resolve(__dirname, '..');
+  const outputDir = process.env.OUTPUT_DIR;
+  const done = [];
+  const notFound = [];
+
+  for (const filename of filteredFiles) {
+    const srcPath = path.join(sourceDir, filename);
+    const dstPath = path.join(outputDir, filename);
+    
+    try {
+      if (fs.existsSync(srcPath)) {
+        fs.copyFileSync(srcPath, dstPath);
+        done.push(filename);
+      } else {
+        notFound.push(filename);
+      }
+    } catch (error) {
+      console.error(`Error copying ${filename}:`, error);
+      notFound.push(filename);
+    }
+  }
+
+  return { done, notFound };
+};
+
+// API Endpoints
+app.post('/api/match-resumes', async (req, res) => {
+  try {
+    const { jdText, topn = 3 } = req.body;
+
+    if (!jdText) {
+      return res.status(400).json({ error: 'Job description is required' });
+    }
+
+    // Read Excel file
+    const workbook = XLSX.readFile(process.env.EXCEL_PATH);
+    const sheetName = workbook.SheetNames[0];
+    const resumeData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+
+    if (!resumeData.length) {
+      return res.status(404).json({ error: 'No resume data found' });
+    }
+
+    // Extract JD tags
+    const jdTags = await extractJdTags(jdText);
+    if (!jdTags) {
+      return res.status(400).json({ error: 'Could not extract tags from job description' });
+    }
+
+    console.log('JD Tags:', jdTags);
+
+    // Find best matches
+    const { selected, scores } = await findBestResumes(jdTags, resumeData, topn);
+    
+    console.log('Final Selected:', selected);
+    console.log('Final Scores:', scores);
+
+    // Copy PDFs only if we have selected resumes
+    const { done, notFound } = selected.length ? copyFilteredPdfs(selected) : { done: [], notFound: [] };
+
+    // Always return a 200 status with the complete response
+    return res.json({
+      success: selected.length > 0,
+      jdTags,
+      matchingResumes: done,
+      notFound,
+      scores: scores || {},
+      ...(selected.length === 0 && { message: 'No resumes with relevance ≥60% were found for this JD' })
+    });
+
+  } catch (error) {
+    console.error('Error in match-resumes endpoint:', error);
+    console.error(error.stack);
+    return res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!', details: err.message });
+});
+
+// Start server
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+  console.log(`Excel Path: ${process.env.EXCEL_PATH}`);
+  console.log(`Output Directory: ${process.env.OUTPUT_DIR}`);
+});
